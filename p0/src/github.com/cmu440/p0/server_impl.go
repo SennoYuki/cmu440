@@ -8,26 +8,24 @@ import (
 	"bufio"
 	"net"
 	"strconv"
-	"time"
 )
 
 type multiEchoServer struct {
-	ln            net.Listener
-	clients       map[*client]bool
-	opChan        chan bool
-	broadcastChan chan []byte
+	ln      net.Listener
+	clients map[*client]bool
+	opChan  chan bool
 }
 
 type client struct {
 	cn net.Conn
+	wr chan []byte
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
 func New() MultiEchoServer {
 	s := &multiEchoServer{
-		broadcastChan: make(chan []byte, 100),
-		clients:       make(map[*client]bool),
-		opChan:        make(chan bool, 1),
+		clients: make(map[*client]bool),
+		opChan:  make(chan bool, 1),
 	}
 	s.opChan <- true
 	return s
@@ -41,7 +39,6 @@ func (mes *multiEchoServer) Start(port int) error {
 	}
 	mes.ln = l
 	go mes.Handle()
-	go mes.BroadCast()
 	return nil
 }
 
@@ -63,9 +60,10 @@ func (mes *multiEchoServer) Handle() {
 		if err != nil {
 			continue
 		}
-		c := &client{cn: conn}
+		c := &client{cn: conn, wr: make(chan []byte, 100)}
 		mes.addConn(c)
-		go mes.handle(c)
+		go mes.write(c)
+		go mes.read(c)
 	}
 }
 
@@ -82,7 +80,15 @@ func (mes *multiEchoServer) killConn(t *client) {
 	delete(mes.clients, t)
 }
 
-func (mes *multiEchoServer) handle(c *client) {
+func (mes *multiEchoServer) write(c *client) {
+	for {
+		select {
+		case b := <-c.wr:
+			c.cn.Write(b)
+		}
+	}
+}
+func (mes *multiEchoServer) read(c *client) {
 	reader := bufio.NewReader(c.cn)
 	for {
 		// Read up to and including the first '\n' character.
@@ -91,23 +97,17 @@ func (mes *multiEchoServer) handle(c *client) {
 			mes.killConn(c)
 			return
 		}
-		mes.broadcastChan <- msgBytes
+		mes.BroadCast(msgBytes)
 	}
 }
 
-func (mes *multiEchoServer) BroadCast() {
-	for {
+func (mes *multiEchoServer) BroadCast(b []byte) {
+	<-mes.opChan
+	defer func() { mes.opChan <- true }()
+	for client := range mes.clients {
 		select {
-		case b := <-mes.broadcastChan:
-			func() {
-				<-mes.opChan
-				defer func() { mes.opChan <- true }()
-				for client := range mes.clients {
-					//超时停止写入，b可能会写入一部分，不影响后续操作
-					client.cn.SetWriteDeadline(time.Now().Add(time.Second))
-					client.cn.Write(b)
-				}
-			}()
+		case client.wr <- b:
+		default:
 		}
 	}
 }
