@@ -2,14 +2,12 @@
 
 package p0
 
-//允许使用的包 bufio fmt net strconv
-
+//You may only use the following packages: bufio, fmt, net, and strconv.
+//因为net.Listen->Accept得到的connection默认读写都不超时，没想到不使用time包实现超时丢弃消息的方法
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -21,16 +19,15 @@ type multiEchoServer struct {
 }
 
 type client struct {
-	cn      net.Conn
-	readBuf []byte
+	cn net.Conn
 }
 
 // New creates and returns (but does not start) a new MultiEchoServer.
 func New() MultiEchoServer {
 	s := &multiEchoServer{
 		broadcastChan: make(chan []byte, 100),
-		clients: make(map[*client]bool),
-		opChan: make(chan bool, 1),
+		clients:       make(map[*client]bool),
+		opChan:        make(chan bool, 1),
 	}
 	s.opChan <- true
 	return s
@@ -40,7 +37,6 @@ func (mes *multiEchoServer) Start(port int) error {
 	addr := ":" + strconv.FormatInt(int64(port), 10)
 	l, err := net.Listen("tcp", addr)
 	if err != nil {
-		ptErr(err)
 		return err
 	}
 	mes.ln = l
@@ -49,11 +45,22 @@ func (mes *multiEchoServer) Start(port int) error {
 	return nil
 }
 
+func (mes *multiEchoServer) Close() {
+	// TODO: implement this!
+}
+
+func (mes *multiEchoServer) Count() int {
+	<-mes.opChan
+	defer func() { mes.opChan <- true }()
+	return len(mes.clients)
+}
+
+// additional methods/functions
+
 func (mes *multiEchoServer) Handle() {
 	for {
 		conn, err := mes.ln.Accept()
 		if err != nil {
-			//ptErr(err)
 			continue
 		}
 		c := &client{cn: conn}
@@ -82,33 +89,10 @@ func (mes *multiEchoServer) handle(c *client) {
 		msgBytes, err := reader.ReadBytes('\n')
 		if err != nil {
 			mes.killConn(c)
-			//ptErr(err)
 			return
 		}
-		mes.broadcastChan<-msgBytes
+		mes.broadcastChan <- msgBytes
 	}
-	/*
-	for {
-		var b [1024]byte
-		n, err := c.cn.Read(b[:])
-		c.cn.SetReadDeadline(time.Now().Add(time.Second))
-		if err != nil {
-			switch {
-			case err == io.EOF:
-				mes.broadcastChan <- c.readBuf
-				c.readBuf = nil
-				continue
-			case strings.Contains(err.Error(), "timeout"):
-				mes.killConn(c)
-				return
-			default:
-				ptErr(err)
-			}
-			continue
-		}
-		c.readBuf = append(c.readBuf, b[:n]...)
-	}
-	 */
 }
 
 func (mes *multiEchoServer) BroadCast() {
@@ -119,39 +103,11 @@ func (mes *multiEchoServer) BroadCast() {
 				<-mes.opChan
 				defer func() { mes.opChan <- true }()
 				for client := range mes.clients {
+					//超时停止写入，b可能会写入一部分，不影响后续操作
 					client.cn.SetWriteDeadline(time.Now().Add(time.Second))
-					_, err := client.cn.Write(b)
-					if err == nil {
-						continue
-					}
-					if strings.Contains(err.Error(), "broken pipe") {
-						mes.killConn(client)
-						continue
-					}
-					if strings.Contains(err.Error(), "connection reset by peer") {
-						mes.killConn(client)
-						continue
-					}
-					ptErr(err)
-
+					client.cn.Write(b)
 				}
 			}()
 		}
 	}
-}
-
-func (mes *multiEchoServer) Close() {
-	// TODO: implement this!
-}
-
-func (mes *multiEchoServer) Count() int {
-	<-mes.opChan
-	defer func() { mes.opChan <- true }()
-	return len(mes.clients)
-}
-
-// TODO: add additional methods/functions below!
-
-func ptErr(err error) {
-	fmt.Println("err:", err)
 }
