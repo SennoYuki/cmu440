@@ -6,6 +6,8 @@ package p0
 //因为net.Listen->Accept得到的connection默认读写都不超时，没想到不使用time包实现超时丢弃消息的方法
 import (
 	"bufio"
+	"fmt"
+	"io"
 	"net"
 	"strconv"
 )
@@ -13,7 +15,7 @@ import (
 type multiEchoServer struct {
 	ln      net.Listener
 	clients map[*client]bool
-	opChan  chan bool
+	opLock  *ConcurrencyResource
 }
 
 type client struct {
@@ -25,9 +27,8 @@ type client struct {
 func New() MultiEchoServer {
 	s := &multiEchoServer{
 		clients: make(map[*client]bool),
-		opChan:  make(chan bool, 1),
+		opLock:  NewConcurrencyResource(1),
 	}
-	s.opChan <- true
 	return s
 }
 
@@ -47,8 +48,8 @@ func (mes *multiEchoServer) Close() {
 }
 
 func (mes *multiEchoServer) Count() int {
-	<-mes.opChan
-	defer func() { mes.opChan <- true }()
+	mes.opLock.Get()
+	defer mes.opLock.Release()
 	return len(mes.clients)
 }
 
@@ -68,15 +69,17 @@ func (mes *multiEchoServer) Handle() {
 }
 
 func (mes *multiEchoServer) addConn(c *client) {
-	<-mes.opChan
-	defer func() { mes.opChan <- true }()
+	mes.opLock.Get()
+	defer mes.opLock.Release()
 	mes.clients[c] = true
 }
 
 func (mes *multiEchoServer) killConn(t *client) {
-	<-mes.opChan
-	defer func() { mes.opChan <- true }()
-	t.cn.Close()
+	mes.opLock.Get()
+	defer mes.opLock.Release()
+	if err := t.cn.Close(); err != nil {
+		fmt.Println(err)
+	}
 	delete(mes.clients, t)
 }
 
@@ -84,7 +87,9 @@ func (mes *multiEchoServer) write(c *client) {
 	for {
 		select {
 		case b := <-c.wr:
-			c.cn.Write(b)
+			if _, err := c.cn.Write(b); err != nil {
+				fmt.Println("write err", err)
+			}
 		}
 	}
 }
@@ -94,20 +99,46 @@ func (mes *multiEchoServer) read(c *client) {
 		// Read up to and including the first '\n' character.
 		msgBytes, err := reader.ReadBytes('\n')
 		if err != nil {
-			mes.killConn(c)
-			return
+			// 连接已被对端关闭
+			if err == io.EOF {
+				mes.killConn(c)
+				return
+			}
+			fmt.Println("read err", err)
 		}
 		mes.BroadCast(msgBytes)
 	}
 }
 
 func (mes *multiEchoServer) BroadCast(b []byte) {
-	<-mes.opChan
-	defer func() { mes.opChan <- true }()
+	mes.opLock.Get()
+	defer mes.opLock.Release()
 	for client := range mes.clients {
 		select {
 		case client.wr <- b:
 		default:
 		}
 	}
+}
+
+func NewConcurrencyResource(limit int) *ConcurrencyResource {
+	r := &ConcurrencyResource{
+		ch: make(chan struct{}, limit),
+	}
+	for i := 0; i < limit; i++ {
+		r.ch <- struct{}{}
+	}
+	return r
+}
+
+type ConcurrencyResource struct {
+	ch chan struct{}
+}
+
+func (r *ConcurrencyResource) Get() {
+	<-r.ch
+}
+
+func (r *ConcurrencyResource) Release() {
+	r.ch <- struct{}{}
 }
